@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.nbi
+*.nbc
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.DS_Store
+# never commit personal photos or recovery output
+*.CR2
+*.cr2
+rescued/
+out/

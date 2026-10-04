@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions / 使用問題
+    url: https://github.com/yin1218/cr2-rescue/discussions
+    about: Ask and share results / 提問與分享修復結果

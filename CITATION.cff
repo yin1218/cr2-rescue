@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: If you use this software, please cite it as below.
+title: "cr2-rescue: recover corrupted and fragmented Canon CR2 photos"
+authors:
+  - family-names: Wu
+    given-names: Chien-Yin
+version: 0.1.0
+date-released: 2026-10-05
+license: MIT
+repository-code: https://github.com/yin1218/cr2-rescue
+keywords:
+  - photo recovery
+  - data recovery
+  - file carving
+  - fragmented JPEG
+  - Canon CR2
+  - digital forensics

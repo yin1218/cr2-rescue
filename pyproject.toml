@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cr2-rescue"
+version = "0.1.0"
+description = "Recover corrupted, truncated or fragmented Canon CR2 RAW photos: rebuild the full-size JPEG after SD card data recovery."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Chien-Yin Wu"}]
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.22", "pillow>=9.1", "numba>=0.56", "scipy>=1.8"]
+keywords = ["cr2", "canon", "raw", "photo recovery", "data recovery", "jpeg repair", "corrupted photos",
+            "sd card recovery", "file carving", "photorec", "digital forensics", "exif",
+            "fragmented jpeg", "raw photo", "photo repair"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics",
+    "Topic :: System :: Recovery Tools",
+    "Topic :: System :: Archiving :: Backup",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/yin1218/cr2-rescue"
+Documentation = "https://github.com/yin1218/cr2-rescue#readme"
+Changelog = "https://github.com/yin1218/cr2-rescue/blob/main/CHANGELOG.md"
+Issues = "https://github.com/yin1218/cr2-rescue/issues"
+
+[project.scripts]
+cr2-rescue = "cr2rescue.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
