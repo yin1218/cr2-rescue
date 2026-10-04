@@ -10,6 +10,6 @@ First public release.
 - Lossless repair from other copies and from a global search over every cluster of every input file.
 - Re-synchronisation after missing clusters; fill from the small image where data is gone.
 - Final whole-run check that drops data from a look-alike photo (e.g. a burst shot) that passed the per-cluster test.
-- Picture area of the small image located per camera model; colour fit robust to damaged rows.
+- Picture area of the small image located per camera model, using only small images that match their own thumbnail (on a damaged card many are overwritten even when the preview is intact); colour fit robust to damaged rows.
 - EXIF (capture time, camera, lens, exposure) and file dates; full metadata with ExifTool when installed.
 - Synthetic damaged-card generator and end-to-end tests.

@@ -18,9 +18,10 @@ from .assemble import Assembler
 from .gsearch import pick_continuation, scan_file
 from .jpeg import Jpeg, markers_ok
 from .reference import (align_small, bands_ok, open_thumb, preview_reduced, render_small, small_array,
-                        thumb_reference)
+                        small_fit, small_score, thumb_reference)
 from .scan import STORE, collect, scan
 
+GOOD_SMALL = 0.9  # an intact small image matches its own thumbnail at least this well (overwritten: ~0)
 FOLDERS = ('intact', 'repaired', 'partial', 'preview-only', 'unverified')
 
 
@@ -90,9 +91,13 @@ def _align_key(photo, aspect):
     return (photo.layout.tags.get('Model'), s['width'], s['height'], round(aspect, 3)) if s else None
 
 
-def align_models(photos, log=print, per_model=6):
+def align_models(photos, log=print, per_model=6, max_tries=60):
     """Where the picture sits inside the small image depends only on the camera model: find it once per model,
-    from a few photos whose small image and thumbnail (and ideally whole preview) are intact."""
+    from a few photos whose small image and thumbnail (and ideally whole preview) are intact.
+
+    On a damaged card many small images are overwritten even when the preview is fine, so every candidate is
+    first fitted to its own thumbnail and used only if it matches (`small_fit`). A partly damaged one can still
+    match at a wrong box; whatever disagrees with the joint box is dropped and the box found again."""
     groups = {}
     for p in photos:
         c = p.copies[0]
@@ -103,36 +108,54 @@ def align_models(photos, log=print, per_model=6):
             jp = Jpeg(STORE.read(c.path, c.offset + po, c.offset + po + min(pl, 65536)) + b'\0' * 16)
         except ValueError:
             continue
-        groups.setdefault(_align_key(p, jp.W / jp.H), []).append((p, c, jp.W / jp.H))
+        groups.setdefault(_align_key(p, jp.W / jp.H), []).append((p, jp.W / jp.H))
     boxes = {}
     for k, members in groups.items():
-        items, fine_n = [], 0
-        for p, c, aspect in members[:40]:
-            a, thumb = _small_of(c), _thumb(p)
-            if a is None or thumb is None:
+        good, tried = [], 0
+        for p, aspect in members:
+            if tried >= max_tries or len(good) >= 2 * per_model or (
+                    len(good) >= per_model and any(g[2] is not None for g in good)):
+                break
+            thumb = _thumb(p)
+            if thumb is None:
                 continue
             tnat = thumb_reference(thumb, aspect)
-            po, pl = c.layout.preview
-            prev = STORE.read(c.path, c.offset + po, c.offset + po + pl)
-            fine = None
-            if len(prev) == pl and markers_ok(prev):
-                fine = preview_reduced(prev)
-                if fine is not None and not all(bands_ok(fine, tnat)):
-                    fine = None
-            if fine is None and fine_n:
-                continue
-            if fine is not None and not fine_n:
-                items = []  # photos with a verified preview make the better reference
-            fine_n += fine is not None
-            items.append((a, tnat, fine))
-            if len(items) >= per_model:
+            for c in p.copies:
+                a = _small_of(c)
+                if a is None or a.shape[:2] != (k[2], k[1]):
+                    continue
+                tried += 1
+                sc, own = small_fit(a, tnat, aspect)
+                if sc < GOOD_SMALL:
+                    continue
+                fine = None
+                if c.layout.preview:
+                    po, pl = c.layout.preview
+                    prev = STORE.read(c.path, c.offset + po, c.offset + po + pl)
+                    if len(prev) == pl and markers_ok(prev):
+                        fine = preview_reduced(prev)
+                        if fine is not None and not all(bands_ok(fine, tnat)):
+                            fine = None
+                good.append((a, tnat, fine, own))
                 break
-        if items:
-            box, sc = align_small(items, k[3])
-            if box is not None:
-                boxes[k] = box
-                log(f'  {k[0]}: picture area of the {k[1]}x{k[2]} image = {box} (match {sc:.3f}, '
-                    f'{len(items)} photo(s){", preview-checked" if fine_n else ""})')
+        items = sorted(good, key=lambda it: it[2] is None)[:per_model]  # a verified preview pins the box best
+        box = None
+        for _ in range(3):
+            if not items:
+                break
+            box, sc = align_small([it[:3] for it in items], k[3], starts=[it[3] for it in items])
+            fit = [it for it in items if box and small_score(it[0], it[1], box) >= GOOD_SMALL]
+            if len(fit) == len(items):
+                break
+            items, box = fit, None
+        if box is not None:
+            boxes[k] = box
+            fine_n = sum(it[2] is not None for it in items)
+            checked = f', {fine_n} preview-checked' if fine_n else ''
+            log(f'  {k[0]}: picture area of the {k[1]}x{k[2]} image = {box} (match {sc:.3f}, {len(items)} photo(s)'
+                f'{checked}; {len(good)} of {tried} small images intact)')
+        else:
+            log(f'  {k[0]}: no intact small image among {tried} tried -- using thumbnails')
     return boxes
 
 

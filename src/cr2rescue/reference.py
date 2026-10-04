@@ -89,38 +89,27 @@ class _Target:
         return float(_norm(np.asarray(c)[1:-1, 1:-1].ravel()) @ T)
 
 
-def align_small(items, aspect):
-    """Find the box of the small image that shows exactly the preview frame (it includes a masked border).
-
-    items: [(small array, thumbnail reference, fine target or None)] of photos from one camera model -- the
-    box is the same for all of them, so their scores are summed. The fine target is an intact preview reduced
-    to about the small image's size; it pins the box down to one pixel, which the thumbnail alone cannot.
-    Brute-force search over box width and position, then hill-climbing. Returns ((x0, y0, w, h), score)."""
-    if not isinstance(items, list):
-        raise TypeError('items must be a list of (array, thumb_ref[, fine])')
-    T = [_Target(*it) for it in items]
-    h, w = items[0][0].shape[:2]
-    fine = any(t.f for t in T)
-
-    def score(x0, y0, cw, fine=False):
-        return sum(t.score((x0, y0, cw, cw / aspect), fine) for t in T) / len(T)
-
-    coarse = []
-    lo = max(int(w * 0.9), 8)
-    for cw in range(w, lo - 1, -2):
+def _boxes(w, h, aspect, step):
+    """Candidate picture areas (x0, y0, width) of a w x h small image: at least 90% of its width."""
+    for cw in range(w, max(int(w * 0.9), 8) - 1, -step):
         ch = cw / aspect
         if ch > h:
             continue
-        for y0 in range(0, int(h - ch) + 1, 2):
-            for x0 in range(0, w - cw + 1, 2):
-                coarse.append((score(x0, y0, cw), (x0, y0, cw)))
-    if not coarse:
-        return None, -1
-    coarse.sort(reverse=True)
-    best = (-2, None)
-    seen = {}
-    for _, start in coarse[:8]:  # hill-climb on the 1-pixel grid from the best coarse boxes
-        top = (seen.setdefault(start, score(*start, fine=fine)), start)
+        for y0 in range(0, int(h - ch) + 1, step):
+            for x0 in range(0, w - cw + 1, step):
+                yield x0, y0, cw
+
+
+def small_score(a, thumb_ref, box):
+    """How well one box of the small image shows the thumbnail's picture (correlation, 1 = perfect)."""
+    return _Target(a, thumb_ref).score(box, False)
+
+
+def _climb(score, starts, w, h, aspect):
+    """Hill-climb on the 1-pixel grid from each start (x0, y0, width); returns the best (score, start)."""
+    best, seen = (-2.0, None), {}
+    for start in starts:
+        top = (seen.setdefault(start, score(*start)), start)
         for _ in range(16):
             x0, y0, cw = top[1]
             nxt = top
@@ -131,16 +120,58 @@ def align_small(items, aspect):
                         if (dx, dy, dw) == (0, 0, 0) or x < 0 or y < 0 or x + c > w or y + c / aspect > h:
                             continue
                         if (x, y, c) not in seen:
-                            seen[(x, y, c)] = score(x, y, c, fine=fine)
+                            seen[(x, y, c)] = score(x, y, c)
                         if seen[(x, y, c)] > nxt[0]:
                             nxt = (seen[(x, y, c)], (x, y, c))
             if nxt is top:
                 break
             top = nxt
-        if top[0] > best[0]:
-            best = top
-    x0, y0, cw = best[1]
-    return (x0, y0, cw, int(round(cw / aspect))), best[0]
+        best = max(best, top, key=lambda b: b[0])
+    return best
+
+
+def small_fit(a, thumb_ref, aspect):
+    """Fit one small image to its own thumbnail (coarse grid, then hill-climbing). An intact small image scores
+    > 0.9; one whose data was overwritten scores near 0 everywhere. Returns (score, (x0, y0, w, h) or None)."""
+    t = _Target(a, thumb_ref)
+    h, w = a.shape[:2]
+
+    def score(x0, y0, cw):
+        return t.score((x0, y0, cw, cw / aspect), False)
+
+    coarse = sorted(((score(*b), b) for b in _boxes(w, h, aspect, 8)), reverse=True)
+    if not coarse:
+        return -1.0, None
+    sc, (x0, y0, cw) = _climb(score, [b for _, b in coarse[:3]], w, h, aspect)
+    return sc, (x0, y0, cw, int(round(cw / aspect)))
+
+
+def align_small(items, aspect, starts=()):
+    """Find the box of the small image that shows exactly the preview frame (it includes a masked border).
+
+    items: [(small array, thumbnail reference, fine target or None)] of photos from one camera model -- the
+    box is the same for all of them, so their scores are summed. The fine target is an intact preview reduced
+    to about the small image's size; it pins the box down to one pixel, which the thumbnail alone cannot.
+    Brute-force search over box width and position, then hill-climbing; with `starts` (boxes already found for
+    single photos by small_fit) only the hill-climbing. Returns ((x0, y0, w, h), score)."""
+    if not isinstance(items, list):
+        raise TypeError('items must be a list of (array, thumb_ref[, fine])')
+    T = [_Target(*it) for it in items]
+    h, w = items[0][0].shape[:2]
+    fine = any(t.f for t in T)
+
+    def score(x0, y0, cw, fine=False):
+        return sum(t.score((x0, y0, cw, cw / aspect), fine) for t in T) / len(T)
+
+    if starts:
+        tops = list(dict.fromkeys(tuple(b[:3]) for b in starts))
+    else:
+        coarse = sorted(((score(*b), b) for b in _boxes(w, h, aspect, 2)), reverse=True)
+        tops = [b for _, b in coarse[:8]]
+    if not tops:
+        return None, -1
+    sc, (x0, y0, cw) = _climb(lambda *b: score(*b, fine=fine), tops, w, h, aspect)
+    return (x0, y0, cw, int(round(cw / aspect))), sc
 
 
 def preview_reduced(jpeg_bytes, scale=8):

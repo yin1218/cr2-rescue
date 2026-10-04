@@ -79,3 +79,42 @@ def test_raw_card_image(tmp_path):
     got = {r['capture_time']: r['category'] for r in rows}
     want = dict(A='intact', B='repaired', C='partial', D='partial', E='intact', F='preview-only', G='intact')
     assert {card['times'][n]: c for n, c in want.items()} == got
+
+
+def _card_with_small_images(folder, damage):
+    """One CR2 per entry of `damage`: None = intact small image, 'other' = overwritten by unrelated picture data
+    (another scene upside down: synthetic scenes all look alike), (dx, dy) = its own small image shifted (fits its
+    thumbnail well, but at a wrong box)."""
+    from cr2rescue.tiff import parse_cr2
+    for k, how in enumerate(damage):
+        im = synth.scene(1536, 1024, seed=60 + k)
+        data, _ = synth.make_cr2(im, when=f'2024:05:02 10:00:{k:02d}', seed=k)
+        s = parse_cr2(data).small
+        if how is not None:
+            a, _ = synth._small(synth.scene(1536, 1024, seed=90 + k).rotate(180) if how == 'other' else im, seed=k)
+            if how != 'other':
+                a = np.roll(a, how[::-1], axis=(0, 1))
+            data = data[:s['offset']] + a.tobytes() + data[s['offset'] + s['length']:]
+        with open(os.path.join(folder, f'IMG_{k:04d}.CR2'), 'wb') as f:
+            f.write(data)
+
+
+def test_alignment_ignores_damaged_small_images(tmp_path):
+    from cr2rescue.recover import align_models
+    from cr2rescue.scan import collect, scan
+    # on a damaged card the small image is often overwritten while the preview is fine
+    _card_with_small_images(str(tmp_path), ['other', 'other', (14, 7), None, 'other', None, None, 'other'])
+    photos = scan(collect([str(tmp_path)]), log=lambda *a: None)[0]
+    lines = []
+    boxes = align_models(photos, log=lines.append, per_model=4)
+    assert list(boxes.values()) == [(5, 3, 192, 128)], lines
+    assert '3 photo(s)' in lines[0] and '4 of 7 small images intact' in lines[0], lines
+
+
+def test_alignment_without_intact_small_images(tmp_path):
+    from cr2rescue.recover import align_models
+    from cr2rescue.scan import collect, scan
+    _card_with_small_images(str(tmp_path), ['other', 'other', 'other'])
+    lines = []
+    assert align_models(scan(collect([str(tmp_path)]), log=lambda *a: None)[0], log=lines.append) == {}
+    assert 'no intact small image' in lines[0]
