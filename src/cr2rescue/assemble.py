@@ -14,6 +14,9 @@ order:
 2. **resync** -- skip the hole, find the bit offset where valid data starts again, locate which MCU it
    belongs to by correlation with the reference, and fix the DC offset. The gap is filled from the
    reference later.
+
+At the end every run that did not come straight from the primary copy is judged over its whole length
+(`check_segments`), which catches look-alike data that passed cluster by cluster.
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ from .jpeg import Jpeg, _decode, unstuff, ycc, rgb_of
 from .reference import mcu_reference
 
 SKIP = 4  # MCUs dropped after a resync point while the decoder settles
+MAX_MAD, MIN_CORR = 10.0, 0.8  # a run from another source must match the reference this well (check_segments)
 _MARKER = re.compile(rb'\xff[^\x00\xff]')
 
 
@@ -73,6 +77,7 @@ class Assembler:
         self.how = np.full(jp.nmcu, -1, np.int16)  # source index of every MCU (-1 = missing)
         self.log = []
         self.holes = []  # decoder state at every hole no source could fill (input of the global search)
+        self.segs = []  # (first MCU, count, source) of every placed run of MCUs
         self.thr = 18.0
         self.blur = blur
         self.say = log or (lambda *a: None)
@@ -102,7 +107,7 @@ class Assembler:
     @property
     def lossless(self):
         """True when every MCU came from an unbroken chain of exact data (no resync gap)."""
-        return bool(self.have.all()) and not any(l[0] == 'resync' for l in self.log)
+        return bool(self.have.all()) and not any(l[0] in ('resync', 'drop') for l in self.log)
 
     # ---------- scoring
     def err(self, m0, mm):
@@ -227,7 +232,51 @@ class Assembler:
                 self.log.append(('stop', j, c))
                 break
             src, j, b, pred = r
+        if not first_only:
+            self.check_segments()
         return self
+
+    # ---------- final check
+    def segment_fit(self, m0, n):
+        """(correlation, mean abs difference) of the picture level of MCUs [m0, m0+n) against the reference,
+        both box-averaged to the reference's own resolution."""
+        from scipy.ndimage import uniform_filter
+        W = self.jp.mcux
+        r0 = m0 // W
+        rows = (m0 + n - 1) // W - r0 + 1
+        idx = np.arange(m0, m0 + n) - r0 * W
+        mask = np.zeros(rows * W)
+        mask[idx] = 1
+        mask = mask.reshape(rows, W)
+        den = uniform_filter(mask, self.blur or (3, 3), mode='constant')
+        out = []
+        for v in (self.ref[0, m0:m0 + n], self.jp.mcu_means(self.dc[m0:m0 + n])[0]):
+            g = np.zeros(rows * W)
+            g[idx] = v
+            g = uniform_filter(g.reshape(rows, W), self.blur or (3, 3), mode='constant')
+            out.append((g / np.maximum(den, 1e-6)).reshape(-1)[idx])
+        r, d = out
+        if r.std() < 3:  # a flat reference says nothing about structure
+            return 1.0, float(np.abs(r - d).mean())
+        c = float(np.corrcoef(r, d)[0, 1]) if d.std() > 0 else 0.0
+        return c, float(np.abs(r - d).mean())
+
+    def check_segments(self):
+        """Drop runs that came from another source but do not show this picture.
+
+        Each cluster was checked on its own, and in smooth areas (a wall, a dark background) another photo's
+        data can pass that test: the error stays small although the content is wrong. Judged over its whole
+        length, a foreign run gives itself away by a low correlation with the reference or a shifted level.
+        Dropped MCUs are filled from the reference like any other gap."""
+        for m0, n, src in self.segs:
+            if src == 0 and m0 == 0:
+                continue  # the start of the primary copy: identified by its own header
+            c, mad = self.segment_fit(m0, n)
+            bad = mad > MAX_MAD or (n >= 1000 and c < MIN_CORR)
+            if bad:
+                self.have[m0:m0 + n] = False
+                self.how[m0:m0 + n] = -1
+                self.log.append(('drop', self.sources[src][0], m0, n, round(c, 3), round(mad, 1)))
 
     def _place(self, m0, co, dcabs, n, src):
         n = min(n, self.jp.nmcu - m0)
@@ -237,6 +286,7 @@ class Assembler:
         self.dc[m0:m0 + n] = dcabs[:n]
         self.have[m0:m0 + n] = True
         self.how[m0:m0 + n] = src
+        self.segs.append((m0, n, src))
 
     def _span_ok(self, j, b, pred, x_from, x_to, piece_bytes):
         """Decode from MCU j (bit b) through photo bytes [x_from, x_to) = piece_bytes and judge them."""

@@ -132,7 +132,10 @@ flowchart LR
 5. **Re-sync.** When nothing continues the picture, find where decodable data starts again after the gap
    (bit-offset search + normalised cross-correlation with the reference + DC offset correction), so one lost
    cluster costs a stripe, not the rest of the photo.
-6. **Fill & export.** Areas that could not be recovered are filled from the upscaled small image. Lossless results are
+6. **Final check.** Every run of data that came from another copy, the global search or a re-sync is compared with
+   the reference over its whole length. In smooth areas (a wall, a dark background) a burst shot of the same scene
+   can pass the per-cluster test; over a long run it shows up as low correlation or a shifted level and is dropped.
+7. **Fill & export.** Areas that could not be recovered are filled from the upscaled small image. Lossless results are
    written byte-for-byte; filled results are re-encoded at quality 95 with EXIF.
 
 The algorithm is tested end-to-end on a synthetic card ([`synth.py`](src/cr2rescue/synth.py)) that reproduces the
