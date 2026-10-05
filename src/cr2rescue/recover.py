@@ -7,7 +7,9 @@ import json
 import os
 import shutil
 import time
+from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 from multiprocessing import get_context
 
 import numpy as np
@@ -17,11 +19,15 @@ from . import export
 from .assemble import Assembler
 from .gsearch import pick_continuation, scan_file
 from .jpeg import Jpeg, markers_ok
-from .reference import (align_small, bands_ok, open_thumb, preview_reduced, render_small, small_array,
-                        small_fit, small_score, thumb_reference)
+from .reference import (align_small, bands_ok, match_colours, mend_rows, open_thumb, preview_reduced,
+                        render_small, small_array, small_fit, small_rows_ok, small_score, small_style,
+                        thumb_reference)
 from .scan import STORE, collect, scan
 
+MIN_GOOD_ROWS = 0.75  # a small image with more overwritten rows than this is not used
 GOOD_SMALL = 0.9  # an intact small image matches its own thumbnail at least this well (overwritten: ~0)
+AGREE = 0.8  # the small image shows the picture that decoded (same photo: > 0.9)
+STYLE_MINUTES = 15  # a photo without thumbnail borrows the colour style of one taken at most this far apart
 FOLDERS = ('intact', 'repaired', 'partial', 'preview-only', 'unverified')
 
 
@@ -89,6 +95,121 @@ def _small_of(c):
 def _align_key(photo, aspect):
     s = photo.layout.small
     return (photo.layout.tags.get('Model'), s['width'], s['height'], round(aspect, 3)) if s else None
+
+
+def _align4(x):
+    return -(-x // 4) * 4
+
+
+def learn_models(photos, log=print):
+    """What all photos of one camera model share, learnt from those where it is readable: the JPEG header of the
+    preview (the same bytes in every photo taken with the same settings) and the size and place of the small
+    image (right after the preview). With it, a photo whose own header or IFD was overwritten can still be read.
+    Returns {model: {'header': bytes, 'small': dict}} (either may be missing)."""
+    heads, smalls = {}, {}
+    for p in photos:
+        model = p.layout.tags.get('Model')
+        for c in p.copies:
+            po, pl = c.layout.preview
+            head = STORE.read(c.path, c.offset + po, c.offset + po + min(pl, 65536))
+            try:
+                jp = Jpeg(head + b'\0' * 16)
+            except ValueError:
+                continue
+            heads.setdefault(model, []).append(bytes(head[:jp.sos_end]))
+            s = c.layout.small
+            if s and not s.get('inferred'):
+                smalls.setdefault(model, []).append(
+                    (s['offset'] - _align4(po + pl), s['width'], s['height'], s.get('spp', 3), s['length']))
+            break
+    models = {}
+    for model, hs in heads.items():
+        m, what = {}, []
+        h, n = Counter(hs).most_common(1)[0]
+        if n >= 3 and n >= 0.9 * len(hs):
+            m['header'] = h
+            what.append(f'same preview header in {n} of {len(hs)} photos')
+        ss = smalls.get(model, [])
+        if len(ss) >= 3 and len(set(ss)) == 1 and ss[0][0] == 0:
+            _, w, h_, spp, length = ss[0]
+            m['small'] = dict(width=w, height=h_, spp=spp, length=length)
+            what.append(f'small image right after the preview in all {len(ss)}')
+        if m:
+            models[model] = m
+            log(f'  {model}: ' + ', '.join(what))
+    return models
+
+
+def infer_layouts(photos, models):
+    """Copies whose IFD of the small image is unreadable get its place from the model (marked 'inferred'; whether
+    it really holds the picture is checked like any small image). Returns how many."""
+    n = 0
+    for p in photos:
+        tmpl = models.get(p.layout.tags.get('Model'), {}).get('small')
+        for c in p.copies if tmpl else ():
+            if c.layout.preview and not c.layout.small:
+                po, pl = c.layout.preview
+                c.layout.small = dict(tmpl, offset=_align4(po + pl), inferred=True)
+                n += 1
+    return n
+
+
+def _when(photo):
+    try:
+        return datetime.strptime(photo.capture_time.split('.')[0], '%Y:%m:%d %H:%M:%S')
+    except (AttributeError, ValueError):
+        return None
+
+
+def _box_of(photo, boxes):
+    s = photo.layout.small
+    if not s:
+        return None
+    for k, box in boxes.items():
+        if k[:3] == (photo.layout.tags.get('Model'), s['width'], s['height']):
+            return box
+    return None
+
+
+def neighbour_styles(photos, boxes, log=print, tries=6):
+    """A photo without a usable thumbnail has nothing to fit the colours of its small image to; borrow the
+    colour style of the nearest photo in time (same camera, at most STYLE_MINUTES apart) whose thumbnail and
+    small image are both intact. Returns {photo key: style}."""
+    need = [p for p in photos if p.layout.small and _box_of(p, boxes) and _thumb(p) is None]
+    if not need:
+        return {}
+    pool = [(_when(p), p) for p in photos if _when(p) and p.layout.small]
+    cache, out = {}, {}
+
+    def style_of(d):
+        if d.key not in cache:
+            cache[d.key] = None
+            thumb, box = _thumb(d), _box_of(d, boxes)
+            for c in d.copies if thumb is not None and box else ():
+                a = _small_of(c)
+                if a is None or not small_rows_ok(a, box).all():
+                    continue
+                tnat = thumb_reference(thumb, box[2] / box[3])
+                if small_score(a, tnat, box) >= GOOD_SMALL and all(bands_ok(render_small(a, box, tnat), tnat)):
+                    cache[d.key] = small_style(a, box, tnat)
+                    break
+        return cache[d.key]
+
+    for p in need:
+        t = _when(p)
+        if t is None:
+            continue
+        near = sorted(((abs((w - t).total_seconds()), d) for w, d in pool
+                       if d is not p and d.layout.tags.get('Model') == p.layout.tags.get('Model')), key=lambda x: x[0])
+        for dt, d in near[:tries]:
+            if dt > STYLE_MINUTES * 60:
+                break
+            st = style_of(d)
+            if st is not None:
+                out[p.key] = st
+                break
+    log(f'  {len(need)} photo(s) without thumbnail, colour style borrowed from a neighbour for {len(out)}')
+    return out
 
 
 def align_models(photos, log=print, per_model=6, max_tries=60):
@@ -159,9 +280,11 @@ def align_models(photos, log=print, per_model=6, max_tries=60):
     return boxes
 
 
-def reference_for(photo, W, H, boxes=None):
+def reference_for(photo, W, H, boxes=None, style=None):
     """Best low-res reference of the full frame: the small RGB image when it is intact, else the thumbnail.
-    Returns (image, kind) with kind in {'small', 'thumb', 'small-unverified', None}."""
+    Without a thumbnail the small image cannot be checked; it is then drawn with `style` (borrowed from a
+    neighbouring photo) or a plain grey-world balance. Returns (image, kind, (small image, box) or None) with
+    kind in {'small', 'thumb', 'small-style', 'small-unverified', None}."""
     aspect = W / H
     thumb = _thumb(photo)
     tnat = thumb_reference(thumb, aspect) if thumb else None
@@ -170,23 +293,30 @@ def reference_for(photo, W, H, boxes=None):
         if a is None:
             continue
         box = (boxes or {}).get(_align_key(photo, aspect))
-        if tnat is None:
-            if box is None:
-                h, w = a.shape[:2]
-                cw = min(w, int(h * aspect))
-                ch = int(round(cw / aspect))
-                box = ((w - cw) // 2, (h - ch) // 2, cw, ch)
-            return render_small(a, box), 'small-unverified'
+        if tnat is None and box is None:
+            h, w = a.shape[:2]
+            cw = min(w, int(h * aspect))
+            ch = int(round(cw / aspect))
+            box = ((w - cw) // 2, (h - ch) // 2, cw, ch)
         if box is None:
             box, _ = align_small([(a, tnat, None)], aspect)
             if box is None:
                 continue
+        ok = small_rows_ok(a, box)
+        if ok.mean() < MIN_GOOD_ROWS:
+            continue
+        if not ok.all():
+            a = mend_rows(a, box, ok)
+        if tnat is None:
+            if style is not None:
+                return render_small(a, box, style=style), 'small-style', (a, box)
+            return render_small(a, box), 'small-unverified', (a, box)
         img = render_small(a, box, tnat)
         if all(bands_ok(img, tnat)):
-            return img, 'small'
+            return match_colours(img, tnat), 'small', (a, box)
     if thumb is not None:
-        return thumb_reference(thumb, aspect, width=max(W // 8, tnat.width)), 'thumb'
-    return None, None
+        return thumb_reference(thumb, aspect, width=max(W // 8, tnat.width)), 'thumb', None
+    return None, None, None
 
 
 # ----------------------------------------------------------------------------------------------- one photo
@@ -197,11 +327,41 @@ def _init(settings):
     _S.update(settings)
 
 
-def _sources(photo, primary, extras):
-    out = [(primary.label, STORE.getter(primary.path, primary.offset))]
+def _overlay(get, at, data):
+    """get() with `data` laid over the bytes at photo offset `at`."""
+    def g(x0, x1):
+        b = bytearray(get(x0, x1))
+        lo, hi = max(x0, at), min(x0 + len(b), at + len(data))
+        if lo < hi:
+            b[lo - x0:hi - x0] = data[lo - at:hi - at]
+        return bytes(b)
+    return g
+
+
+def _get(c, header=None):
+    """Photo-relative reader of one copy; with `header`, the preview's JPEG header is replaced by it."""
+    g = STORE.getter(c.path, c.offset)
+    return _overlay(g, c.layout.preview[0], header) if header else g
+
+
+def _readable(photo, header=None):
+    """Copies whose preview JPEG header parses, with the parsed header."""
+    out = []
+    for c in photo.copies:
+        po, pl = c.layout.preview
+        try:
+            jp = Jpeg(_get(c, header)(po, po + min(pl, 65536)) + b'\0' * 16)
+        except ValueError:
+            continue
+        out.append((c, jp))
+    return out
+
+
+def _sources(photo, primary, extras, header=None):
+    out = [(primary.label, _get(primary, header))]
     for c in photo.copies:
         if c is not primary:
-            out.append((c.label + ' copy', STORE.getter(c.path, c.offset)))
+            out.append((c.label + ' copy', _get(c, header)))
     for path, shift in extras:
         out.append((f'{os.path.basename(path)}@{shift} found', STORE.getter(path, shift)))
     return out
@@ -220,16 +380,12 @@ def process(job):
 
 
 def _process(photo, extras, pno, cluster, work, r):
-    # usable copies = JPEG header readable
-    cands = []
-    for c in photo.copies:
-        po, pl = c.layout.preview
-        head = STORE.read(c.path, c.offset + po, c.offset + po + min(pl, 65536))
-        try:
-            jp = Jpeg(head + b'\0' * 16)
-        except ValueError:
-            continue
-        cands.append((c, jp))
+    # usable copies = JPEG header readable (else: the header all photos of this camera share)
+    header = None
+    cands = _readable(photo)
+    if not cands:
+        header = _S.get('headers', {}).get(photo.layout.tags.get('Model'))
+        cands = _readable(photo, header) if header else []
     if not cands:
         thumb = _thumb(photo)
         if thumb is not None:
@@ -238,14 +394,16 @@ def _process(photo, extras, pno, cluster, work, r):
         r.note = 'JPEG header of the preview is damaged in every copy'
         return r, []
     W, H = cands[0][1].W, cands[0][1].H
-    ref, kind = reference_for(photo, W, H, _S.get('boxes'))
+    ref, kind, small = reference_for(photo, W, H, _S.get('boxes'), _S.get('styles', {}).get(photo.key))
     r.reference = kind or 'none'
-    blur = (5, 3) if kind == 'thumb' else None
+    blur = (5, 3) if kind == 'thumb' else (3, 3)  # the small image is a little softer and may sit half a pixel off
+    if header:
+        r.note = 'JPEG header copied from other photos of this camera'
 
-    if ref is None:  # nothing to check against: keep a copy that decodes to the end, as-is
+    if ref is None and header is None:  # nothing to check against: keep a copy that decodes to the end, as-is
         for c, jp in cands:
             po, pl = c.layout.preview
-            b = STORE.read(c.path, c.offset + po, c.offset + po + pl)
+            b = _get(c)(po, po + pl)
             if len(b) == pl and markers_ok(b):
                 r.category, r.coverage, r.primary = 'unverified', 1.0, c.label
                 r.file = _save(work, photo, pno, b)
@@ -253,13 +411,17 @@ def _process(photo, extras, pno, cluster, work, r):
                 return r, []
         r.note = 'no reference and no complete copy'
         return r, []
+    if ref is None:
+        r.note += '; nothing to check the picture against'
+        return r, []
 
     # primary copy = the one with the longest good start
     scored = []
     for c, jp in cands:
         po, pl = c.layout.preview
         try:
-            a = Assembler([(c.label, STORE.getter(c.path, c.offset))], po, pl, ref, cluster, blur).run(first_only=True)
+            a = Assembler([(c.label, _get(c, header))], po, pl, ref, cluster, blur,
+                          own_header=header is None).run(first_only=True)
         except ValueError:
             continue
         scored.append((a.coverage, c.offset == 0, c))
@@ -269,16 +431,38 @@ def _process(photo, extras, pno, cluster, work, r):
     scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
     primary = scored[0][2]
     po, pl = primary.layout.preview
-    a = Assembler(_sources(photo, primary, extras), po, pl, ref, cluster, blur).run()
+    srcs = _sources(photo, primary, extras, header)
+    unsure = kind in ('small-style', 'small-unverified')
+    a = Assembler(srcs, po, pl, ref, cluster, blur, own_header=header is None).run(check=not unsure)
+    if unsure:  # colours of the reference are a guess: fit them to what decoded, then do it again
+        ref2, agree = _self_fit(a, small, ref)
+        if ref2 is not None:
+            ref, r.reference = ref2, kind + '+fit'
+            a = Assembler(srcs, po, pl, ref, cluster, blur, own_header=header is None).run()
+        elif agree is not None:  # the small image shows another picture: there is nothing to check against
+            a = Assembler(srcs[:1], po, pl, ref, cluster, blur, own_header=header is None).run_straight()
+            r.reference, r.primary, r.coverage, r.sources = 'none', primary.label, a.coverage, [primary.label]
+            r.note = '; '.join(filter(None, [r.note, f'small image shows another picture (match {agree:.2f})']))
+            if a.coverage >= 0.5:
+                r.category = 'unverified'
+                r.file = _save(work, photo, pno, a.jpeg_bytes() or a.image(None))
+            return r, []
+        else:
+            a.check_segments()
     r.primary = primary.label
     r.coverage = a.coverage
     used = sorted(set(int(k) for k in np.unique(a.how) if k >= 0))
     r.sources = [a.sources[k][0] for k in used]
 
     clean = len(a.log) == 1 and a.log[0][0] == 'ok' and a.log[0][4] is None
-    if clean and a.have.all():
+    if not clean and kind == 'small' and header is None and _whole_by_thumb(photo, primary, W, H, cluster):
+        clean = True  # the small image is stored after the preview and can be the damaged one
+        r.coverage, r.sources, r.reference = 1.0, [primary.label], 'thumb'
+        r.note = 'small image does not match the preview and the thumbnail; not used'
+        a.have[:] = True
+    if clean and a.have.all() and header is None:
         r.category = 'intact'
-        b = STORE.read(primary.path, primary.offset + po, primary.offset + po + pl)
+        b = _get(primary)(po, po + pl)
         r.file = _save(work, photo, pno, b)
         r.owns = _owns(b, po, cluster)
         return r, []
@@ -299,6 +483,42 @@ def _process(photo, extras, pno, cluster, work, r):
         r.category = 'preview-only'
         r.file = _save(work, photo, pno, ref.resize((W, H), Image.LANCZOS))
     return r, holes
+
+
+def _whole_by_thumb(photo, c, W, H, cluster):
+    """Is the preview of copy c complete on its own: it decodes in one piece to its EOI marker and every cluster
+    matches the camera thumbnail?"""
+    thumb = _thumb(photo)
+    if thumb is None:
+        return False
+    tnat = thumb_reference(thumb, W / H)
+    ref = thumb_reference(thumb, W / H, width=max(W // 8, tnat.width))
+    po, pl = c.layout.preview
+    a = Assembler([(c.label, _get(c))], po, pl, ref, cluster, (5, 3)).run(first_only=True)
+    return a.log[0][3] == a.jp.nmcu and a.log[0][4] is None and a.whole()
+
+
+def _self_fit(a, small, ref):
+    """Reference redrawn with the colour style fitted to the part of the preview that decoded (a single global
+    fit, so foreign data cannot make itself match). Returns (reference, agreement): (None, None) if too little
+    decoded, (None, agreement) if the small image does not show the decoded picture."""
+    got = a.picture()
+    if got is None or small is None:
+        return None, None
+    pic, (fx, fy) = got
+    lum = pic.mean(2)
+    known = np.isfinite(lum)
+    g = ref.convert('L').resize((lum.shape[1], lum.shape[0]), Image.BOX, box=(0, 0, ref.width * fx, ref.height * fy))
+    agree = float(np.corrcoef(lum[known], np.asarray(g, np.float32)[known])[0, 1])
+    if not agree >= AGREE:
+        return None, agree
+    arr, (x0, y0, cw, ch) = small
+    part = (x0, y0, max(1, round(cw * fx)), max(1, round(ch * fy)))
+    try:
+        style = small_style(arr, part, pic)
+    except np.linalg.LinAlgError:
+        return None, None
+    return render_small(arr, (x0, y0, cw, ch), style=style), agree
 
 
 def _save(work, photo, pno, what):
@@ -347,9 +567,16 @@ def recover(paths, out_dir, opt: Options = None, log=print):
     work = os.path.join(out_dir, '.work')
     os.makedirs(work, exist_ok=True)
     jobs = opt.jobs or os.cpu_count() or 1
+    log('Learning what photos of the same camera share ...')
+    models = learn_models(photos, log)
+    n = infer_layouts(photos, models)
+    if n:
+        log(f'  small image placed from the camera model for {n} copy(ies) with an unreadable IFD')
     log('Locating the picture area of the small images ...')
     boxes = align_models(photos, log)
-    settings = dict(cluster=cluster, work=work, quality=opt.quality, min_coverage=opt.min_coverage, boxes=boxes)
+    styles = neighbour_styles(photos, boxes, log)
+    settings = dict(cluster=cluster, work=work, quality=opt.quality, min_coverage=opt.min_coverage, boxes=boxes,
+                    headers={m: v['header'] for m, v in models.items() if 'header' in v}, styles=styles)
     ctx = get_context('spawn')
 
     best = {}

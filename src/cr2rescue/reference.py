@@ -218,31 +218,48 @@ def _robust_fit(X, Y, rows, bands=8):
     return M
 
 
-def render_small(a, box, thumb_ref=None):
-    """Linear camera RGB -> display RGB. With a thumbnail, colour matrix + tone curve are fitted to it (the
-    thumbnail carries the camera's picture style); otherwise a plain gamma with grey-world balance."""
+GARBAGE_STEP = 8000  # 16-bit step between neighbouring pixels that a picture hardly ever makes (foreign data: most)
+GARBAGE_SHARE = 0.05  # rows with more such steps than this are overwritten (picture rows: < 2%)
+
+
+def small_rows_ok(a, box):
+    """Rows of the picture area that hold picture data. Overwritten rows are noise over the whole 16-bit range,
+    also where the foreign data starts in the middle of a row; this test needs no thumbnail."""
     x0, y0, cw, ch = box
-    black = black_level(a)
-    lin = np.clip(a[y0:y0 + ch, x0:x0 + cw] - black, 0, None)
-    flat = np.c_[lin.reshape(-1, 3), np.ones(ch * cw)]
-    if thumb_ref is None:
-        g = lin.reshape(-1, 3)
-        gain = g.mean() / np.maximum(g.mean(0), 1e-6)
-        v = g * gain
-        v = (v / max(np.percentile(v, 99.5), 1e-6)).clip(0, 1) ** (1 / 2.2)
-        return Image.fromarray((v * 255 + 0.5).astype(np.uint8).reshape(ch, cw, 3))
+    step = np.abs(np.diff(a[y0:y0 + ch, x0:x0 + cw], axis=1)).mean(axis=2)
+    return (step > GARBAGE_STEP).mean(axis=1) < GARBAGE_SHARE
+
+
+def mend_rows(a, box, ok):
+    """Copy of the small image with every overwritten row of the picture area replaced by the nearest good row."""
+    x0, y0, cw, ch = box
+    good = np.flatnonzero(ok)
+    near = good[np.abs(np.arange(ch)[:, None] - good[None, :]).argmin(1)]
+    out = a.copy()
+    out[y0:y0 + ch] = a[y0 + near]
+    return out
+
+
+def small_style(a, box, thumb_ref):
+    """Colour matrix + per-channel tone curve that turn the small image's linear camera RGB into the camera's
+    picture, fitted to the thumbnail. Photos taken in the same light share it. thumb_ref may also be a float
+    (h, w, 3) array in 0..255 with NaN where there is nothing to fit to."""
+    x0, y0, cw, ch = box
+    lin = np.clip(a[y0:y0 + ch, x0:x0 + cw] - black_level(a), 0, None)
     t = thumb_ref
-    small = np.stack([np.asarray(Image.fromarray(lin[..., c]).resize(t.size, Image.BOX)) for c in range(3)], -1)
+    size = t.size if isinstance(t, Image.Image) else (t.shape[1], t.shape[0])
+    small = np.stack([np.asarray(Image.fromarray(lin[..., c]).resize(size, Image.BOX)) for c in range(3)], -1)
     X = np.c_[small.reshape(-1, 3), np.ones(small.shape[0] * small.shape[1])]
     Yg = np.asarray(t, np.float32).reshape(-1, 3) / 255
+    known = np.isfinite(Yg).all(1)  # a target may leave pixels out (NaN)
+    X, Yg = X[known], Yg[known]
     Yl = Yg ** 2.2
     M = _robust_fit(X, Yl, small.shape[0])
     pred_small = np.clip(X @ M, 0, None) ** (1 / 2.2)
-    pred = np.clip(flat @ M, 0, None) ** (1 / 2.2)
     r = np.abs(X @ M - Yl).sum(1)
     keep = r <= max(3 * np.median(r), 0.02)
     pred_small, Yg = pred_small[keep], Yg[keep]
-    out = np.empty_like(pred)
+    curves = []
     for c in range(3):  # picture-style tone curve: binned median of thumbnail value per predicted value
         edges = np.quantile(pred_small[:, c], np.linspace(0, 1, 33))
         xs, ys = [], []
@@ -254,13 +271,50 @@ def render_small(a, box, thumb_ref=None):
         keep = np.r_[True, np.diff(xs) > 1e-4] if xs else []
         xs, ys = list(np.asarray(xs)[keep]), list(np.asarray(ys)[keep])
         if len(xs) < 2:
-            out[:, c] = pred[:, c]
+            curves.append(None)
             continue
         ys = np.maximum.accumulate(ys)
-        xs = [0.0] + xs + [max(1.0, xs[-1] * 1.2)]
-        ys = [0.0] + list(ys) + [1.0]
-        out[:, c] = np.interp(pred[:, c], xs, ys)
+        curves.append(([0.0] + xs + [max(1.0, xs[-1] * 1.2)], [0.0] + list(ys) + [1.0]))
+    return M, curves
+
+
+def render_small(a, box, thumb_ref=None, style=None):
+    """Linear camera RGB -> display RGB. With a thumbnail, colour matrix + tone curve are fitted to it (the
+    thumbnail carries the camera's picture style); else a style fitted on another photo (small_style); else
+    a plain gamma with grey-world balance."""
+    x0, y0, cw, ch = box
+    lin = np.clip(a[y0:y0 + ch, x0:x0 + cw] - black_level(a), 0, None)
+    if thumb_ref is not None:
+        style = small_style(a, box, thumb_ref)
+    if style is None:
+        g = lin.reshape(-1, 3)
+        gain = g.mean() / np.maximum(g.mean(0), 1e-6)
+        v = g * gain
+        v = (v / max(np.percentile(v, 99.5), 1e-6)).clip(0, 1) ** (1 / 2.2)
+        return Image.fromarray((v * 255 + 0.5).astype(np.uint8).reshape(ch, cw, 3))
+    M, curves = style
+    pred = np.clip(np.c_[lin.reshape(-1, 3), np.ones(ch * cw)] @ M, 0, None) ** (1 / 2.2)
+    out = np.empty_like(pred)
+    for c in range(3):
+        out[:, c] = pred[:, c] if curves[c] is None else np.interp(pred[:, c], *curves[c])
     return Image.fromarray((np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8).reshape(ch, cw, 3))
+
+
+def match_colours(img, target, sigma=1.0):
+    """Give a rendered small image the colours of `target` (the camera's own thumbnail, or a float (h, w, 3)
+    array with NaN where unknown) at the target's scale, keeping the small image's finer detail. Removes the
+    regional colour error a global colour fit leaves. Check the small image against the thumbnail *before*
+    this: afterwards it matches the thumbnail by construction."""
+    from scipy.ndimage import gaussian_filter
+    t = np.asarray(target, np.float32)
+    size = (t.shape[1], t.shape[0])
+    low = np.asarray(img.resize(size, Image.BOX), np.float32)
+    known = np.isfinite(t).all(2).astype(np.float32)
+    d = np.where(known[..., None] > 0, t - low, 0)
+    m = gaussian_filter(known, sigma)
+    d = np.stack([gaussian_filter(d[..., c], sigma) for c in range(3)], -1) / np.maximum(m, 1e-3)[..., None]
+    up = np.stack([np.asarray(Image.fromarray(d[..., c]).resize(img.size, Image.BICUBIC)) for c in range(3)], -1)
+    return Image.fromarray(np.clip(np.asarray(img, np.float32) + up, 0, 255).astype(np.uint8))
 
 
 def mcu_reference(ref_rgb: Image.Image, jp):

@@ -21,6 +21,7 @@ At the end every run that did not come straight from the primary copy is judged 
 from __future__ import annotations
 
 import re
+import warnings
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -60,11 +61,14 @@ def sliding_ncc(seq, ref):
 
 
 class Assembler:
-    def __init__(self, sources, po, pl, ref_rgb, cluster=32768, blur=None, log=None):
+    def __init__(self, sources, po, pl, ref_rgb, cluster=32768, blur=None, log=None, own_header=True):
         """sources: list of (name, get) where get(x0, x1) returns photo-relative bytes [x0, x1) (may be short).
         sources[0] is the primary copy. po/pl: preview offset/length relative to the CR2 header.
-        blur: (rows, cols) box for the error when the reference is soft (the camera thumbnail)."""
+        blur: (rows, cols) box for the error when the reference is soft (the camera thumbnail).
+        own_header: False when the JPEG header was copied from another photo, so the data right after it is
+        not vouched for by it."""
         self.sources, self.po, self.pl, self.cluster = sources, po, pl, cluster
+        self.own_header = own_header
         self.buf = bytearray(bytes(sources[0][1](po, po + pl)).ljust(pl, b'\0'))
         self.orig = bytes(self.buf)
         self.reparse()
@@ -184,8 +188,9 @@ class Assembler:
         return a >= b or plausible(bytes(self.buf[a:b]))
 
     # ---------- main loop
-    def run(self, max_steps=200, first_only=False):
-        """first_only: stop after the first decode (a quick health check of one copy)."""
+    def run(self, max_steps=200, first_only=False, check=True):
+        """first_only: stop after the first decode (a quick health check of one copy).
+        check: finish with check_segments (leave it out to look at what was found before judging it)."""
         jp = self.jp
         j, b, pred = 0, 0, (0, 0, 0)
         src = 0
@@ -225,6 +230,9 @@ class Assembler:
             if visits == 0:
                 self._record_hole(j, b, pred, c)
             # 2) resync after the hole
+            k = min(600, keep)
+            rate = (self.x_of_bit(int(st[keep])) - self.x_of_bit(int(st[keep - k]))) / k if k >= 50 else None
+            self._at = (self.x_of_bit(b), rate)
             first_pass = sorted({0, src})
             r = self._resync(j, c, first_pass) or self._resync(
                 j, c, [k for k in range(len(self.sources)) if k not in first_pass], max_e=8)
@@ -232,7 +240,7 @@ class Assembler:
                 self.log.append(('stop', j, c))
                 break
             src, j, b, pred = r
-        if not first_only:
+        if check and not first_only:
             self.check_segments()
         return self
 
@@ -269,7 +277,7 @@ class Assembler:
         length, a foreign run gives itself away by a low correlation with the reference or a shifted level.
         Dropped MCUs are filled from the reference like any other gap."""
         for m0, n, src in self.segs:
-            if src == 0 and m0 == 0:
+            if src == 0 and m0 == 0 and self.own_header:
                 continue  # the start of the primary copy: identified by its own header
             c, mad = self.segment_fit(m0, n)
             bad = mad > MAX_MAD or (n >= 1000 and c < MIN_CORR)
@@ -352,7 +360,7 @@ class Assembler:
                 tail = bytes(get(e, self.ent_end()))
                 if len(tail) < 4096:
                     continue
-                r = self._resync_at(j, tail, kmax, probe, long)
+                r = self._resync_at(j, tail, kmax, probe, long, e)
                 if r is not None:
                     m0, bit_rel, pred, peak, margin = r
                     self.buf[c - self.po:e - self.po] = b'\0' * (e - c)  # hole
@@ -363,7 +371,7 @@ class Assembler:
                     return k, m0, b, pred
         return None
 
-    def _resync_at(self, j, tail, kmax, probe, long):
+    def _resync_at(self, j, tail, kmax, probe, long, e=None):
         jp = self.jp
         buf, _ = unstuff(tail[:400000])
         T = (jp.maxcode, jp.mincode, jp.valptr, jp.huffval, jp.blk_dc, jp.blk_ac)
@@ -410,7 +418,7 @@ class Assembler:
         if best is None:
             return None
         peak, margin, m0, co, st, dc, mm, L = best
-        if peak < 0.8 or margin < 0.08:
+        if peak < 0.8 or margin < 0.08 and not self._where_expected(j, m0, e, co, st):
             return None
         r = self.ref[:, m0:m0 + L]
         off = np.round([np.median(r[0] - mm[0, :L]) * 8 / jp.qy, np.median(r[1] - mm[1, :L]) * 8 / jp.qc,
@@ -421,6 +429,60 @@ class Assembler:
         if np.median(e) > self.thr:
             return None
         return m0, int(st[0]), (int(off[0]), int(off[1]), int(off[2])), peak, margin
+
+    def _where_expected(self, j, m0, e, co, st):
+        """Does the byte count put the resynced data near MCU m0? In smooth areas (sky, a wall) the rows just
+        above and below match the reference almost as well, so the score alone cannot pick the row; the
+        number of bytes missing before e, at the bytes per MCU around the hole, can."""
+        if e is None or getattr(self, '_at', None) is None:
+            return False
+        x_j, rate = self._at
+        after = (int(st[-1]) - int(st[0])) / 8 / len(co)
+        rate = after if rate is None else (rate + after) / 2
+        pred = j + (e - x_j + int(st[0]) / 8) / rate
+        return abs(m0 - pred) <= max(1.5 * self.jp.mcux, 0.05 * (pred - j))
+
+    def whole(self):
+        """Does the primary copy decode in one piece to the very end: every MCU, the last one finishing right
+        before the EOI marker? (a gap or foreign data inside the stream shifts where the decode ends)"""
+        co, st, n, errf = self.jp.decode(0, self.jp.nmcu)
+        if n < self.jp.nmcu:
+            return False
+        eoi = bytes(self.buf).rfind(b'\xff\xd9', max(0, len(self.buf) - 64))
+        return eoi >= 0 and 0 <= self.po + eoi - self.x_of_bit(int(st[n])) <= 1
+
+    def run_straight(self):
+        """Without a usable reference: keep what decodes straight on from the header of the primary copy, up to
+        the cluster where decoding breaks (and any implausible clusters right before it)."""
+        jp = self.jp
+        co, st, n, errf = jp.decode(0, jp.nmcu)
+        keep = n
+        if n < jp.nmcu:
+            sa = self._stuffed_at
+            c = int(self.ent0 + sa[min(int(st[n]) // 8, len(sa) - 1)]) // self.cluster * self.cluster
+            while c - self.cluster > self.ent0 and not self.bytes_ok(c - self.cluster):
+                c -= self.cluster
+            keep = self._keep_before(st, n, c)
+        self._place(0, co, jp.dc_chain(co[:keep], (0, 0, 0)), keep, 0)
+        self.log.append(('straight', self.sources[0][0], 0, keep, None))
+        return self
+
+    def picture(self, min_share=0.02):
+        """What has been decoded so far as a low-res float RGB image: one pixel per square of whole MCUs (two
+        MCU rows when an MCU is twice as wide as tall), NaN where nothing was decoded. Returns (image, (fx, fy))
+        with the share of the frame's width and height it covers, or None when too little was decoded."""
+        jp = self.jp
+        if self.have.mean() < min_share:
+            return None
+        k = max(1, round(jp.mcu_w / jp.mcu_h))
+        cols, rows = jp.W // jp.mcu_w, jp.H // (jp.mcu_h * k)
+        if not cols or not rows:
+            return None
+        c = np.where(self.have, jp.mcu_means(self.dc), np.nan).reshape(3, jp.mcuy, jp.mcux)
+        c = c[:, :rows * k, :cols].reshape(3, rows, k, cols).mean(2)
+        Y, Cb, Cr = c[0], c[1] - 128, c[2] - 128
+        rgb = np.stack([Y + 1.402 * Cr, Y - 0.344136 * Cb - 0.714136 * Cr, Y + 1.772 * Cb], -1)
+        return np.clip(rgb, 0, 255), (cols * jp.mcu_w / jp.W, rows * k * jp.mcu_h / jp.H)
 
     # ---------- output
     def jpeg_bytes(self):
@@ -462,7 +524,9 @@ class Assembler:
             x, y = R[k], M[k]
             keep = np.ones(len(x), bool)
             for _ in range(3):
-                a, b = np.polyfit(x[keep], y[keep], 1)
+                with warnings.catch_warnings():  # a flat reference makes the fit ill-conditioned; the clip below copes
+                    warnings.simplefilter('ignore')
+                    a, b = np.polyfit(x[keep], y[keep], 1)
                 r = y - (a * x + b)
                 keep = np.abs(r) < 3 * 1.4826 * np.median(np.abs(r[keep])) + 1
             a = float(np.clip(a, 0.7, 1.4))

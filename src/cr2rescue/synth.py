@@ -146,7 +146,7 @@ def make_cr2(img, when='2024:05:01 10:00:00', subsec='00', model='Canon EOS Synt
 
     to = 0x2000
     po = (to + len(thumb) + 0xFFF) // 0x1000 * 0x1000
-    so = po + len(prev)
+    so = (po + len(prev) + 3) // 4 * 4  # Canon starts the small image at the next multiple of 4
     ro = so + len(small)
     ifd0, exif, ifd1, ifd2, ifd3 = _Ifd(), _Ifd(), _Ifd(), _Ifd(), _Ifd()
     at0 = 0x10
@@ -174,7 +174,7 @@ def make_cr2(img, when='2024:05:01 10:00:00', subsec='00', model='Canon EOS Synt
         p = _pack_ifd(ifd, at, nxt)
         blob[at:at + len(p)] = p
     assert len(blob) == to
-    out = bytes(blob) + thumb + b'\0' * (po - to - len(thumb)) + prev + small + raw
+    out = bytes(blob) + thumb + b'\0' * (po - to - len(thumb)) + prev + b'\0' * (so - po - len(prev)) + small + raw
     return out, prev
 
 

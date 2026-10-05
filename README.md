@@ -45,6 +45,9 @@ map to check, cluster by cluster, which data really belongs to the photo, and re
   different places).
 - 🔎 Searches **all recovered files** (or a raw card image) for the missing pieces.
 - 🎨 Fills what is truly gone from the photo's own small image, so you get the whole frame instead of a grey band.
+- 🧠 **Learns from your other photos:** a photo whose JPEG header was overwritten borrows it from photos of the same
+  camera (it is the same bytes in all of them), one whose small image lost its directory entry gets its place from
+  the camera model, and one without a thumbnail borrows the colours of a photo taken minutes before or after.
 - 📷 Keeps **EXIF** (capture time, camera, lens, exposure; with [ExifTool](https://exiftool.org) installed, all maker
   notes too) and sets the file date to the capture time, so photo apps sort them correctly.
 - 🔒 Runs **offline** on your computer; originals are opened read-only and never changed.
@@ -82,7 +85,7 @@ rescued/
 ├── repaired/        all pieces found and put back together — lossless
 ├── partial/         most of the photo recovered; the rest filled from its small image   "IMG_1234 (87%).jpg"
 ├── preview-only/    the full-size data is gone; the photo's small image, upscaled          "IMG_1234 (preview only).jpg"
-├── unverified/      decodes, but there was no reference to verify it against
+├── unverified/      decodes, but nothing could verify it (no reference, or the small image shows another picture)
 ├── report.csv       one row per photo: result, coverage, which files/copies were used
 └── report.json
 ```
@@ -93,8 +96,10 @@ Example run (the synthetic card from the demo):
 $ cr2-rescue recover card/ -o rescued
 Searching 8 file(s) for CR2 photos ...
 Found 8 copies of 7 photo(s); cluster size 8192 bytes
+Learning what photos of the same camera share ...
+  Canon EOS Synthetic: same preview header in 7 of 7 photos, small image right after the preview in all 7
 Locating the picture area of the small images ...
-  Canon EOS Synthetic: picture area of the 200x133 image = (5, 3, 192, 128) (match 0.997, 2 photo(s), preview-checked)
+  Canon EOS Synthetic: picture area of the 200x133 image = (5, 3, 192, 128) (match 0.993, 5 photo(s), 2 preview-checked; 5 of 5 small images intact)
 Pass 1: rebuilding 7 photo(s) ...
   intact: 2, repaired: 1, partial: 3, preview-only: 1
 Global search: 4 hole(s) x every 8 KB cluster of 8 file(s) ...
@@ -105,12 +110,27 @@ Copying full metadata with exiftool ...
 Result: 2 intact, 2 repaired, 2 partial, 1 preview-only
 ```
 
+### On a real card
+
+498 photos from an EOS M2, recovered with data-recovery software from a damaged SD card; many files fragmented
+or partly overwritten. One run, about 47 minutes on a laptop:
+
+| Result | Photos |
+|---|---:|
+| intact (lossless) | 373 |
+| repaired (lossless) | 15 |
+| partial | 98 (median 72% recovered, 24 of them ≥ 90%) |
+| preview-only | 8 |
+| unverified | 1 |
+| failed | 3 (preview and small image both overwritten) |
+
 ## How it works
 
 ```mermaid
 flowchart LR
   A[Recovered files<br/>or card image] --> B[Find every CR2 header<br/>group copies by capture time]
-  B --> C[Per-cluster check against<br/>the thumbnail + small RGB image]
+  B --> L[Learn from other photos<br/>of the same camera]
+  L --> C[Per-cluster check against<br/>the thumbnail + small RGB image]
   C -->|cluster OK| D[Keep]
   C -->|cluster bad| E[Try other copies]
   E --> F[Global search: decode every cluster<br/>of every file from the hole's state]
@@ -122,24 +142,43 @@ flowchart LR
 1. **Scan.** Every CR2 header (TIFF `II*\0` + `CR`) in every file is a *copy*. Copies with the same camera model and
    capture time (to 1/100 s) are the same photo. The card's cluster size is inferred from where headers sit.
 2. **References.** Each CR2 has a 160×120 JPEG thumbnail and an uncompressed 16-bit linear RGB image (e.g. 660×441,
-   with a masked sensor border). The picture area inside the border is located once per camera model by matching
-   against intact previews; the colour/tone transform is fitted to the thumbnail (robustly, ignoring damaged rows).
-3. **Verify cluster by cluster.** The baseline JPEG is decoded MCU by MCU; the average colour of every block is compared
+   with a masked sensor border). The picture area inside the border is located once per camera model, from photos
+   whose small image matches their own thumbnail (on a damaged card many are overwritten even when the preview is
+   fine) and pinned to the pixel with intact previews; the colour/tone transform is fitted to the thumbnail
+   (robustly, ignoring damaged rows), then the thumbnail's colours are transferred region by region. Rows of the
+   small image that were overwritten (noise over the whole 16-bit range) are recognised on their own and replaced by
+   the nearest intact row.
+3. **Learn from the other photos.** What all photos of one camera share is learnt from those where it is readable:
+   - the preview's **JPEG header** (quantisation and Huffman tables — the same bytes in every photo taken with the
+     same settings): a photo whose header was overwritten gets it back and decodes again;
+   - **where the small image sits** (right after the preview): a photo whose directory entry for it was lost still
+     has a reference;
+   - the **colour style**: a photo without a usable thumbnail draws its small image in the style of the nearest photo
+     in time, then refits it to the part of its own preview that decoded (one global fit, so foreign data cannot make
+     itself match).
+
+   If the small image does not show the picture that decodes (another photo's data was written there), it is not
+   used at all: only what decodes straight on from the header is kept, in `unverified/`. The small image is stored
+   after the preview, so it can also be the damaged one: a preview that decodes in one piece right up to its end
+   marker and matches the thumbnail everywhere stays intact even where its small image disagrees.
+4. **Verify cluster by cluster.** The baseline JPEG is decoded MCU by MCU; the average colour of every block is compared
    with the reference. The first cluster where the picture stops matching is where the file goes wrong.
-4. **Repair.** From that point, try the data at the same position in other copies, then search *every* cluster of
+5. **Repair.** From that point, try the data at the same position in other copies, then search *every* cluster of
    every input file for one that continues the picture seamlessly (decoded from the exact bit/DC state at the hole,
    with uniqueness checks and ownership checks so data belonging to another finished photo is never borrowed).
-5. **Re-sync.** When nothing continues the picture, find where decodable data starts again after the gap
+6. **Re-sync.** When nothing continues the picture, find where decodable data starts again after the gap
    (bit-offset search + normalised cross-correlation with the reference + DC offset correction), so one lost
-   cluster costs a stripe, not the rest of the photo.
-6. **Final check.** Every run of data that came from another copy, the global search or a re-sync is compared with
+   cluster costs a stripe, not the rest of the photo. In smooth areas (sky, a wall) the rows just above and below
+   match almost as well; there the number of missing bytes picks the row.
+7. **Final check.** Every run of data that came from another copy, the global search or a re-sync is compared with
    the reference over its whole length. In smooth areas (a wall, a dark background) a burst shot of the same scene
    can pass the per-cluster test; over a long run it shows up as low correlation or a shifted level and is dropped.
-7. **Fill & export.** Areas that could not be recovered are filled from the upscaled small image. Lossless results are
+8. **Fill & export.** Areas that could not be recovered are filled from the upscaled small image. Lossless results are
    written byte-for-byte; filled results are re-encoded at quality 95 with EXIF.
 
 The algorithm is tested end-to-end on a synthetic card ([`synth.py`](src/cr2rescue/synth.py)) that reproduces the
-failure modes: fragmentation, overwritten clusters, truncation, multiple damaged copies, destroyed previews.
+failure modes: fragmentation, overwritten clusters, truncation, multiple damaged copies, destroyed previews,
+overwritten JPEG headers, thumbnails and small images.
 
 ## FAQ
 
@@ -152,6 +191,12 @@ how many photos it found and how much of each decodes correctly.
 That is the classic sign of a **fragmented** file: from some point on, the file contains data from another photo (or
 nothing). This is exactly what `cr2-rescue` repairs. Give it all recovered files (or a card image) so it can find the
 missing part.
+
+### The file says the JPEG is damaged / has no thumbnail
+Every photo a camera takes with the same settings starts its JPEG with the same header, so `cr2-rescue` borrows it
+from your other photos; a missing thumbnail is replaced by the colours of a neighbouring photo (see step 3 of
+[How it works](#how-it-works)). When the thumbnail *and* the small image are both overwritten, nothing is left to
+tell the photo's data from someone else's; such photos are reported as failed instead of guessed.
 
 ### PhotoRec (or Disk Drill, Recuva, EaseUS…) recovered CR2s but most are broken
 Carving tools save each file as one contiguous run of data from its header. Feed that output to `cr2-rescue`, ideally
@@ -197,7 +242,8 @@ make them whole.
 - Output is the embedded JPEG, not RAW (see FAQ).
 - Areas filled from the small image are soft (the small image is ~1/8 of the full width). The file name shows how
   much is real: `IMG_1234 (87%).jpg`.
-- A photo needs its CR2 header (first cluster). Clusters that were overwritten on the card and exist in no copy are
+- A photo needs its CR2 header (the first bytes: capture time and where everything is); a damaged JPEG header
+  inside it can be borrowed from other photos of the same camera. Clusters that were overwritten on the card and exist in no copy are
   gone for good.
 - The search assumes a FAT32/exFAT card (cluster-aligned files), which is what cameras use.
 
