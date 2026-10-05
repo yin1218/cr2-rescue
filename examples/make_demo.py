@@ -1,14 +1,17 @@
 """Build the before/after pictures used in the README from a synthetic, damaged memory card.
 
     python examples/make_demo.py            # writes docs/images/demo.jpg and docs/images/social-preview.png
+    python examples/make_demo.py sharpen [--upscaler PATH]   # docs/images/sharpen.jpg (needs OpenCV)
 
 No real photos are involved: synth.py draws the scenes and damages the card the way real recoveries go wrong.
 """
+import argparse
 import io
 import os
 import sys
 import tempfile
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFile, ImageFont
 
 from cr2rescue import synth
@@ -48,8 +51,72 @@ def what_a_viewer_shows(path):
         ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 
+def city(w, h, seed=0):
+    """Tall buildings full of windows: the fine, regular detail a thumbnail fill turns to mush."""
+    rng = np.random.default_rng(seed)
+    y = np.linspace(0, 1, h)[:, None, None]
+    img = Image.fromarray((255 * ((1 - y) * [0.45, 0.62, 0.85] + y * [0.85, 0.88, 0.92]) * np.ones((1, w, 1)))
+                          .astype(np.uint8))
+    d = ImageDraw.Draw(img)
+    x = -rng.uniform(0, 80)
+    while x < w:
+        bw = rng.uniform(140, 320)
+        top = rng.uniform(0.02, 0.35) * h
+        wall = tuple(int(v) for v in rng.uniform(70, 200) * np.array([1, rng.uniform(.9, 1.05), rng.uniform(.9, 1.15)]))
+        d.rectangle([x, top, x + bw, h], fill=wall)
+        ww, wh = rng.uniform(10, 22), rng.uniform(14, 28)
+        gx, gy = ww + rng.uniform(6, 16), wh + rng.uniform(8, 18)
+        for yy in np.arange(top + 14, h - wh, gy):
+            for xx in np.arange(x + 10, x + bw - ww - 6, gx):
+                lit = rng.random() < 0.3
+                c = (235, 210, 140) if lit else tuple(int(v * rng.uniform(.25, .45)) for v in wall)
+                d.rectangle([xx, yy, xx + ww, yy + wh], fill=c)
+        x += bw + rng.uniform(4, 40)
+    img = np.asarray(img, np.float32) + rng.normal(0, 3, (h, w, 3))
+    return np.clip(img, 0, 255)
+
+
+def sharpen_demo(upscaler=None):
+    """The blurry thumbnail fill of a partial photo, and what `cr2-rescue sharpen` makes of it with a second shot
+    of the same scene taken a moment later (the camera moved a little)."""
+    import cv2
+    from cr2rescue import sharpen as S
+    w, h, m = 1920, 1280, 160
+    scene = city(w + 2 * m, h + 2 * m, seed=7)
+    truth = scene[m:m + h, m:m + w]
+    M = cv2.getRotationMatrix2D((w / 2 + m, h / 2 + m), 0.8, 1.0)
+    M[:, 2] += (-37, -19)
+    N = cv2.warpAffine(scene, M, scene.shape[1::-1], flags=cv2.INTER_CUBIC)[m:m + h, m:m + w]
+    hole = np.zeros((h, w), bool)
+    hole[int(h * 0.45):] = True  # the data ran out here
+    small = cv2.resize(truth, (w // 32, h // 32), interpolation=cv2.INTER_AREA)
+    T = np.where(hole[..., None], cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC), truth)
+    A, trust, _ = S.from_neighbour(T, ~hole, N, f=32)
+    C = S.upscale(T, hole, 32, upscaler) if upscaler else None
+    out = S.compose(T, hole, A, trust, C)
+    cw, ch, pad, head = 600, 400, 24, 64
+    y0, x0 = int(h * 0.45) - 80, 700
+    cols = [(T, 'Filled in (blurry)', '原本補的（糊）', (170, 30, 30)),
+            (out, 'After cr2-rescue sharpen', '補細節後', (20, 120, 50)),
+            (truth, 'What was really there', '實際的樣子', (60, 60, 60))]
+    sheet = Image.new('RGB', (pad + len(cols) * (cw + pad), head + ch + pad), (250, 250, 250))
+    d = ImageDraw.Draw(sheet)
+    for i, (x, en, zh, col) in enumerate(cols):
+        crop = np.clip(x[y0:y0 + ch, x0:x0 + cw], 0, 255).astype(np.uint8)
+        sheet.paste(Image.fromarray(crop), (pad + i * (cw + pad), head))
+        d.text((pad + i * (cw + pad) + cw // 2, 30), f'{en} / {zh}', fill=col, font=font(24), anchor='mm')
+    sheet.save(os.path.join(OUT, 'sharpen.jpg'), quality=90, optimize=True)
+    print('wrote', os.path.normpath(os.path.join(OUT, 'sharpen.jpg')))
+
+
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('what', nargs='?', choices=['card', 'sharpen'], default='card')
+    ap.add_argument('--upscaler')
+    a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
+    if a.what == 'sharpen':
+        return sharpen_demo(a.upscaler)
     tmp = tempfile.mkdtemp()
     card = synth.make_card(os.path.join(tmp, 'card'), cluster=8192, size=(1536, 1024), seed=3)
     rows = recover([os.path.join(tmp, 'card')], os.path.join(tmp, 'out'), Options(exiftool='no'), log=print)

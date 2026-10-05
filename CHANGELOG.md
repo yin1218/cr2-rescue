@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.0 — 2026-10-05
+
+- `cr2-rescue sharpen`: gives the blurry, filled-in part of partial photos detail again.
+  - **neighbour**: real detail from a photo of the same camera taken up to 3 minutes apart. SIFT matches on the
+    decoded part; the transform (similarity, affine or homography) is the one that best predicts the matches held
+    out next to the hole, since it has to extrapolate into it. Colours fitted, optical flow for what moved (only
+    where the coarse pictures disagree), and the detail used only where the neighbour's coarse picture agrees
+    with the fill and the flow did not bend it out of shape.
+  - **upscale**: an x4 AI super-resolution model run with `realesrgan-ncnn-vulkan` (default `realesrgan-x4plus`)
+    on the box around the hole, colours pinned to the fill.
+  - By default both: the neighbour where it is trusted, the upscaler for the rest. Decoded pixels are never
+    changed. Writes `sharpened/` with the same file names and EXIF, and `sharpen.json`.
+  - A stopped run goes on where it was.
+  - Optional dependency: `pip install 'cr2-rescue[sharpen]'` (OpenCV).
+- `recover` writes `masks/<photo>.png` for partial photos (white = decoded data) and a `mask` column in the report.
+- Progress shows up as it goes when the output is sent to a file.
+
 ## 0.1.0 — 2026-10-05
 
 First public release.

@@ -55,6 +55,7 @@ class Result:
     primary: str = ''
     sources: list = field(default_factory=list)
     file: str = ''                   # work file holding the output
+    mask: str = ''                   # work file: which pixels of a partial picture are decoded data
     note: str = ''
     owns: list = field(default_factory=list)  # fingerprints of the clusters this photo is made of
 
@@ -479,6 +480,7 @@ def _process(photo, extras, pno, cluster, work, r):
     if a.coverage > 0 and a.coverage >= _S.get('min_coverage', 0):
         r.category = 'partial'
         r.file = _save(work, photo, pno, a.image(ref))
+        r.mask = _save_mask(work, photo, pno, a)
     else:
         r.category = 'preview-only'
         r.file = _save(work, photo, pno, ref.resize((W, H), Image.LANCZOS))
@@ -519,6 +521,21 @@ def _self_fit(a, small, ref):
     except np.linalg.LinAlgError:
         return None, None
     return render_small(arr, (x0, y0, cw, ch), style=style), agree
+
+
+def _save_mask(work, photo, pno, a):
+    """1-bit PNG of a partial picture: white = decoded data, black = filled in from the low-res reference."""
+    jp = a.jp
+    m = a.have.reshape(jp.mcuy, jp.mcux).repeat(jp.mcu_h, 0).repeat(jp.mcu_w, 1)[:jp.H, :jp.W]
+    path = os.path.join(work, f'{photo.name}.p{pno}.mask.png')
+    Image.fromarray(np.ascontiguousarray(m)).save(path)
+    return path
+
+
+def _discard(r):
+    for f in (r.file, r.mask):
+        if f and os.path.exists(f):
+            os.remove(f)
 
 
 def _save(work, photo, pno, what):
@@ -594,11 +611,11 @@ def recover(paths, out_dir, opt: Options = None, log=print):
             for k, (res, hs) in enumerate(pool.imap_unordered(process, jobs_in)):
                 old = best.get(res.key)
                 if _better(res, old):
-                    if old and old.file and os.path.exists(old.file):
-                        os.remove(old.file)
+                    if old:
+                        _discard(old)
                     best[res.key] = res
-                elif res.file and os.path.exists(res.file):
-                    os.remove(res.file)
+                else:
+                    _discard(res)
                 holes += [h for h in hs if (h['key'], h['c'], h['j']) not in searched]
                 if (k + 1) % 25 == 0 or k + 1 == len(jobs_in):
                     log(f'  {k + 1}/{len(jobs_in)}  ({time.time() - t0:.0f}s)')
@@ -656,7 +673,7 @@ def _export(photos, best, out_dir, opt, log):
     use_exiftool = opt.exiftool == 'yes' or (opt.exiftool == 'auto' and export.exiftool_available())
     for p in photos:
         r = best.get(p.key) or Result(p.key, p.name, note='not processed')
-        dest = ''
+        dest = mask = ''
         if r.file and os.path.exists(r.file):
             if r.category == 'partial':
                 fname = f'{p.name} ({max(1, int(r.coverage * 100))}%).jpg'
@@ -670,6 +687,10 @@ def _export(photos, best, out_dir, opt, log):
             st = os.stat(r.file)
             shutil.move(r.file, dest)
             os.utime(dest, (st.st_atime, st.st_mtime))
+            if r.category == 'partial' and r.mask and os.path.exists(r.mask):
+                os.makedirs(os.path.join(out_dir, 'masks'), exist_ok=True)
+                mask = os.path.join(out_dir, 'masks', fname[:-4] + '.png')
+                shutil.move(r.mask, mask)
             if use_exiftool:
                 c = p.copies[0]
                 n = min(c.layout.preview[0], 1 << 20)
@@ -681,7 +702,8 @@ def _export(photos, best, out_dir, opt, log):
         rows.append(dict(name=p.name, category=r.category, coverage=round(r.coverage, 4), reference=r.reference,
                          capture_time=p.capture_time or '', model=p.layout.tags.get('Model', ''),
                          copies=len(p.copies), primary=r.primary, sources=' | '.join(r.sources),
-                         output=os.path.relpath(dest, out_dir) if dest else '', note=r.note))
+                         output=os.path.relpath(dest, out_dir) if dest else '',
+                         mask=os.path.relpath(mask, out_dir) if mask else '', note=r.note))
     if heads:
         log('Copying full metadata with exiftool ...')
         export.copy_all_metadata(heads, log)

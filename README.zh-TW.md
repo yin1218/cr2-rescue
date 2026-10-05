@@ -16,6 +16,7 @@
 
 <p align="center">
   <a href="#快速開始">快速開始</a> •
+  <a href="#讓補圖變清楚選用">讓補圖變清楚</a> •
   <a href="#運作原理">運作原理</a> •
   <a href="#常見問題">常見問題</a> •
   <a href="#和其他工具的比較">和其他工具比較</a> •
@@ -41,6 +42,7 @@
 - 🧩 會整合同一張照片的**所有副本**（救援軟體常把同一張照片存好幾份，每份壞在不同地方）。
 - 🔎 會在**所有救回的檔案**（或整張記憶卡的映像檔）中搜尋遺失的碎片。
 - 🎨 真的找不回來的部分，用該照片自己的小圖補上，得到完整畫面而不是一條灰帶。
+- ✨ 選用：讓補上的那塊**重新變清楚**——從前後幾秒拍的照片借真實細節，其餘用 AI 放大（[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)）。
 - 🧠 **向你的其他照片借資料**：JPEG 檔頭被覆蓋的照片，向同一台相機的其他照片借（每張都是一模一樣的位元組）；
   小圖目錄遺失的照片，依相機機型推算小圖位置；沒有縮圖的照片，借用前後幾分鐘內拍的照片的色彩風格。
 - 📷 保留 **EXIF**（拍攝時間、相機、鏡頭、曝光；有安裝 [ExifTool](https://exiftool.org) 時連 Maker Notes 都保留），
@@ -80,6 +82,7 @@ rescued/
 ├── partial/         大部分救回，其餘用小圖補上             「IMG_1234 (87%).jpg」
 ├── preview-only/    全尺寸資料已不存在，用小圖放大          「IMG_1234 (preview only).jpg」
 ├── unverified/      可以解碼，但無法驗證（沒有參考圖，或小圖其實是別的畫面）
+├── masks/           每張 partial 照片哪些像素是真的解碼資料（白色）；給 `sharpen` 用
 ├── report.csv       每張照片一列：結果、還原比例、用了哪些檔案/副本
 └── report.json
 ```
@@ -96,6 +99,41 @@ rescued/
 | preview-only | 8 |
 | unverified | 1 |
 | failed | 3（大圖和小圖都被覆蓋） |
+
+## 讓補圖變清楚（選用）
+
+資料真的不見的地方，會用相機縮圖補上：顏色和形狀對，但很糊（縮圖只有約 1/32 的細節）。
+`cr2-rescue sharpen` 用兩種方式讓這一塊重新有細節：
+
+![部分救回的照片：縮圖補的模糊區塊、cr2-rescue sharpen 之後、實際的樣子（程式產生的畫面）](docs/images/sharpen.jpg)
+
+<sub>畫面由 <code>python examples/make_demo.py sharpen</code> 產生：資料在最上面一排窗戶下方就斷了。</sub>
+
+| | 做法 | 細節 | 適合 |
+|---|---|---|---|
+| **neighbour（相鄰照片）** | 從前後幾秒拍的同場景照片借細節：SIFT 對位、會動的東西用光流修正，只在和補圖一致的地方使用 | **真實的** | 兩張之間沒變的東西：建築、風景、桌上的物品、文字 |
+| **upscale（AI 放大）** | AI 超解析度模型（[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)）依補圖內容重畫 | 推測出來的，但自然 | 所有地方，包括移動過的人和樹 |
+
+預設兩種一起用：相鄰照片對得上的地方用真實細節，其他地方用 AI 放大。真的解碼出來的資料完全不會被改動。
+
+以[上面的真實案例](#真實案例)為例：98 張部分救回的照片在筆電（Apple M2）上約花 100 分鐘。
+其中 28 張有同場景的相鄰照片，補圖區的中位數 62% 拿到真實細節；其餘部分由 AI 放大重畫。
+補圖區的邊緣清晰度中位數提高 3.4 倍，約是同一張照片真實解碼部分的四分之三。
+
+```bash
+pip install 'cr2-rescue[sharpen] @ git+https://github.com/yin1218/cr2-rescue.git'
+# AI 放大（選用）：從 https://github.com/xinntao/Real-ESRGAN/releases 下載你系統的 realesrgan-ncnn-vulkan，
+# 解壓縮後放到 PATH（或用 --upscaler 指定路徑）
+cr2-rescue sharpen ./rescued          # -> ./rescued/sharpened/，檔名相同
+```
+
+- AI 放大用 GPU 執行（Vulkan；Apple Silicon 用 Metal）。沒有安裝時只用相鄰照片。
+  macOS 若下載的執行檔被擋：`xattr -d com.apple.quarantine realesrgan-ncnn-vulkan`。
+- `sharpened/sharpen.json` 記錄每張照片用了哪張相鄰照片、補圖區有多少比例拿到真實細節。
+- 中途停掉的話，再跑一次會從停下的地方繼續（想用別的設定重做，改用另一個 `-o`）。
+- `--method neighbour|upscale|both`、`--model 名稱`（upscaler 的 `models` 資料夾中任一 x4 模型，預設
+  `realesrgan-x4plus`）、`-j` 同時處理幾張（每張約需 2 GB 記憶體）。
+- 需要 `recover` 0.2 以上寫出的遮罩（masks）；舊版的輸出資料夾請重新跑一次 `recover`。
 
 ## 運作原理
 
@@ -159,6 +197,10 @@ flowchart LR
 這類「檔案刻錄（carving）」工具會從檔頭開始，把連續的一段資料存成一個檔案。把輸出交給 `cr2-rescue`，最好加上 `--all-files`
 並附上記憶卡映像檔。
 
+### 補上的部分很糊，可以變清楚嗎？
+可以，用 `cr2-rescue sharpen`（見[上面](#讓補圖變清楚選用)）。檔案裡的細節已經不在了，只能從別處拿：前後幾秒拍的同場景照片
+（真實細節，限沒有改變的地方），或 AI 放大（自然但推測出來的細節）。建議也保留未處理的版本。
+
 ### 能救回 RAW 原始資料嗎？
 不行。它重建的是每個 CR2 都內含的全尺寸 JPEG（8-bit、已套用相機的相片風格，和拍 RAW+JPEG L 得到的 JPEG 相同）。
 碎片化檔案中的 RAW 資料沒有可供驗證的結構，所以不嘗試。
@@ -173,6 +215,7 @@ flowchart LR
 ### 要跑多久？
 重建每張照片只要幾秒。全域搜尋每一輪會把所有輸入檔案的每個區塊讀一次，幾百張照片大約幾分鐘到一小時。
 想先快速看結果可以加 `--no-global-search`。
+`sharpen` 用 AI 放大時每張部分救回的照片約 1 分鐘（Apple M2），不用 AI 放大會更快。
 
 ### 剛遺失照片，第一步該做什麼？
 立刻停止使用那張記憶卡。先做一份映像檔（ddrescue / dd），之後都只對映像檔操作，並在處理完之前保留記憶卡。
@@ -193,6 +236,7 @@ flowchart LR
 
 - 輸出的是內嵌 JPEG，不是 RAW（見常見問題）。
 - 用小圖補上的區域會比較模糊（小圖約是全寬的 1/8）。檔名會標示真實資料的比例：`IMG_1234 (87%).jpg`。
+  `sharpen` 可以改善，但 AI 放大的細節是推測的；相鄰照片的細節只用在兩張一致的地方（移動過的東西會維持模糊或交給 AI 重畫）。
 - 照片需要有 CR2 檔頭（檔案最前面：拍攝時間與各部分的位置）；其中的 JPEG 檔頭壞了可以向同一台相機的其他照片借。在記憶卡上被覆蓋、且沒有任何副本的區塊，就真的救不回來了。
 - 搜尋假設記憶卡是 FAT32/exFAT（檔案以區塊對齊），這也是相機使用的格式。
 
@@ -204,6 +248,9 @@ from cr2rescue.recover import Options, recover
 rows = recover(['./recovered'], './rescued', Options(all_files=True, jobs=4))
 for r in rows:
     print(r['name'], r['category'], r['coverage'])
+
+from cr2rescue.sharpen import sharpen
+sharpen('./rescued', method='both', upscaler='/path/to/realesrgan-ncnn-vulkan')
 ```
 
 ## 開發

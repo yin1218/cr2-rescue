@@ -16,6 +16,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a> •
+  <a href="#sharpen-the-filled-in-part-optional">Sharpen</a> •
   <a href="#how-it-works">How it works</a> •
   <a href="#faq">FAQ</a> •
   <a href="#compared-with-other-tools">Compared with other tools</a> •
@@ -45,6 +46,8 @@ map to check, cluster by cluster, which data really belongs to the photo, and re
   different places).
 - 🔎 Searches **all recovered files** (or a raw card image) for the missing pieces.
 - 🎨 Fills what is truly gone from the photo's own small image, so you get the whole frame instead of a grey band.
+- ✨ Optional: gives that filled-in part **detail again** — real detail from the photo you shot seconds before or after,
+  and an AI upscaler ([Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)) for the rest.
 - 🧠 **Learns from your other photos:** a photo whose JPEG header was overwritten borrows it from photos of the same
   camera (it is the same bytes in all of them), one whose small image lost its directory entry gets its place from
   the camera model, and one without a thumbnail borrows the colours of a photo taken minutes before or after.
@@ -86,6 +89,7 @@ rescued/
 ├── partial/         most of the photo recovered; the rest filled from its small image   "IMG_1234 (87%).jpg"
 ├── preview-only/    the full-size data is gone; the photo's small image, upscaled          "IMG_1234 (preview only).jpg"
 ├── unverified/      decodes, but nothing could verify it (no reference, or the small image shows another picture)
+├── masks/           which pixels of each partial photo are decoded data (white); used by `sharpen`
 ├── report.csv       one row per photo: result, coverage, which files/copies were used
 └── report.json
 ```
@@ -123,6 +127,43 @@ or partly overwritten. One run, about 47 minutes on a laptop:
 | preview-only | 8 |
 | unverified | 1 |
 | failed | 3 (preview and small image both overwritten) |
+
+## Sharpen the filled-in part (optional)
+
+Where the data is truly gone, the photo is filled in from the camera's thumbnail: right colours and shapes, but
+blurry (the thumbnail has about 1/32 of the detail). `cr2-rescue sharpen` gives that part detail again, in two ways:
+
+![The blurry thumbnail fill of a partial photo, the same area after cr2-rescue sharpen, and what was really there (synthetic scene)](docs/images/sharpen.jpg)
+
+<sub>Synthetic scene made by <code>python examples/make_demo.py sharpen</code>: the data ran out just below the top row of windows.</sub>
+
+| | how | the detail is | works on |
+|---|---|---|---|
+| **neighbour** | takes the detail from a photo shot seconds before or after: aligned with SIFT, optical flow for what moved, used only where it agrees with the fill | **real** | what did not change between the two shots: buildings, landscape, things on a table, text |
+| **upscale** | an AI super-resolution model ([Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)) redraws the fill from what it shows | invented, but plausible | everything, including people and trees that moved |
+
+By default both are used: the neighbour where it fits, the upscaler for the rest. Decoded data is never changed.
+
+On the [real card above](#on-a-real-card), the 98 partial photos took about 100 minutes on a laptop (Apple M2).
+28 had a neighbouring shot of the same scene, which gave real detail to a median 62% of their filled area; the
+rest of the fill was redrawn by the upscaler. Edge strength in the filled area went up a median 3.4×, to about
+three quarters of the decoded part of the same photo.
+
+```bash
+pip install 'cr2-rescue[sharpen] @ git+https://github.com/yin1218/cr2-rescue.git'
+# the AI upscaler (optional): download realesrgan-ncnn-vulkan for your OS from
+# https://github.com/xinntao/Real-ESRGAN/releases, unzip it, put it on PATH (or pass --upscaler PATH)
+cr2-rescue sharpen ./rescued          # -> ./rescued/sharpened/, same file names
+```
+
+- The upscaler runs on the GPU (Vulkan; Metal on Apple silicon). Without it only the neighbouring photos are used.
+  On macOS, if the downloaded binary is blocked: `xattr -d com.apple.quarantine realesrgan-ncnn-vulkan`.
+- `sharpened/sharpen.json` tells for each photo which neighbour was used and how much of the filled area got real
+  detail from it.
+- A stopped run goes on where it was when started again (use another `-o` to redo photos with other settings).
+- `--method neighbour|upscale|both`, `--model NAME` (any x4 model in the upscaler's `models` folder; default
+  `realesrgan-x4plus`), `-j` photos at a time (about 2 GB of memory each).
+- Needs the masks written by `recover` 0.2+; for an older output folder, run `recover` again.
 
 ## How it works
 
@@ -202,6 +243,11 @@ tell the photo's data from someone else's; such photos are reported as failed in
 Carving tools save each file as one contiguous run of data from its header. Feed that output to `cr2-rescue`, ideally
 with `--all-files` and a raw image of the card.
 
+### The filled-in part is blurry — can it be sharper?
+Yes, with `cr2-rescue sharpen` ([above](#sharpen-the-filled-in-part-optional)). The detail itself is gone from the
+file, so it has to come from somewhere else: a photo of the same scene taken seconds apart (real detail, where the
+scene did not change) or an AI upscaler (plausible, invented detail). Keep the unsharpened version as well.
+
 ### Does it recover the RAW sensor data?
 No. It rebuilds the camera's full-resolution JPEG that every CR2 contains (8-bit, with the camera's picture style
 applied — the same as shooting RAW+JPEG L). RAW data in a fragmented file has no structure that allows verification,
@@ -218,6 +264,7 @@ No. Everything runs locally; nothing is sent over the network. Input files are o
 ### How long does it take?
 The rebuild takes seconds per photo. The global search reads every cluster of every input file once per round,
 so for hundreds of photos expect minutes to an hour. Use `--no-global-search` for a quick first pass.
+`sharpen` takes about a minute per partial photo with the AI upscaler (Apple M2), less without it.
 
 ### What should I do first if I just lost photos?
 Stop using the card. Make a raw image of it (ddrescue / dd), work only on the image, and keep the card until you are
@@ -241,7 +288,9 @@ make them whole.
 
 - Output is the embedded JPEG, not RAW (see FAQ).
 - Areas filled from the small image are soft (the small image is ~1/8 of the full width). The file name shows how
-  much is real: `IMG_1234 (87%).jpg`.
+  much is real: `IMG_1234 (87%).jpg`. `sharpen` helps, but detail from the AI upscaler is invented, and detail
+  from a neighbouring photo is only used where the two agree (things that moved stay soft or are redrawn by the
+  upscaler).
 - A photo needs its CR2 header (the first bytes: capture time and where everything is); a damaged JPEG header
   inside it can be borrowed from other photos of the same camera. Clusters that were overwritten on the card and exist in no copy are
   gone for good.
@@ -255,6 +304,9 @@ from cr2rescue.recover import Options, recover
 rows = recover(['./recovered'], './rescued', Options(all_files=True, jobs=4))
 for r in rows:
     print(r['name'], r['category'], r['coverage'])
+
+from cr2rescue.sharpen import sharpen
+sharpen('./rescued', method='both', upscaler='/path/to/realesrgan-ncnn-vulkan')
 ```
 
 ## Development

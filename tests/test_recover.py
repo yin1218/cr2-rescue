@@ -46,6 +46,16 @@ def test_partial_results_are_close(card, recovered):
     assert recovered['by_photo']['C']['coverage'] > 0.85   # resynced after the overwritten clusters
 
 
+def test_partial_results_have_a_mask(recovered):
+    for row in recovered['rows']:
+        if row['category'] != 'partial':
+            assert not row['mask']
+            continue
+        m = Image.open(recovered['out'] / row['mask'])
+        assert m.mode == '1' and m.size == Image.open(recovered['out'] / row['output']).size
+        assert abs(np.asarray(m).mean() - row['coverage']) < 0.02
+
+
 def test_preview_only_keeps_picture(card, recovered):
     row = recovered['by_photo']['F']
     out, ref = _pixels(recovered['out'] / row['output']), _orig(card, 'F')

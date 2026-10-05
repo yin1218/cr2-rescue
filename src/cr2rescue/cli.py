@@ -1,4 +1,4 @@
-"""Command line interface: `cr2-rescue scan` and `cr2-rescue recover`."""
+"""Command line interface: `cr2-rescue scan`, `cr2-rescue recover` and `cr2-rescue sharpen`."""
 from __future__ import annotations
 
 import argparse
@@ -11,6 +11,7 @@ EPILOG = """examples:
   cr2-rescue scan ./recovered
   cr2-rescue recover ./recovered -o ./rescued
   cr2-rescue recover card.img --all-files -o ./rescued      (raw image of the memory card)
+  cr2-rescue sharpen ./rescued                              (detail for the blurry filled-in parts)
 
 docs: https://github.com/yin1218/cr2-rescue"""
 
@@ -55,11 +56,25 @@ def build_parser():
                    help='copy all metadata incl. maker notes with exiftool if installed (default: auto)')
     r.add_argument('--quality', type=int, default=95, help='JPEG quality for re-encoded pictures (default: 95)')
     r.add_argument('--keep-work', action='store_true', help='keep the temporary .work folder')
+
+    h = sub.add_parser('sharpen', help="give the blurry filled-in part of partial photos detail again "
+                                       "(pip install 'cr2-rescue[sharpen]')")
+    h.add_argument('rescued', help='output folder of cr2-rescue recover')
+    h.add_argument('-o', '--out', help='output folder (default: RESCUED/sharpened)')
+    h.add_argument('--method', choices=('both', 'neighbour', 'upscale'), default='both',
+                   help='neighbour = real detail from a photo taken seconds apart; upscale = AI upscaler '
+                        '(realesrgan-ncnn-vulkan); both = neighbour where it fits, upscaler elsewhere (default)')
+    h.add_argument('--upscaler', metavar='PATH', help='realesrgan-ncnn-vulkan executable (default: found on PATH)')
+    h.add_argument('--model', default='realesrgan-x4plus', help='x4 upscaling model (default: realesrgan-x4plus)')
+    h.add_argument('-j', '--jobs', type=int, default=2, help='photos at a time (default: 2; ~2 GB of memory each)')
+    h.add_argument('--quality', type=int, default=95, help='JPEG quality (default: 95)')
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(line_buffering=True)  # progress shows up even when the output goes to a file
     if args.cmd == 'scan':
         from .recover import quick_scan
         files, photos, cluster, problems, health = quick_scan(args.paths, args.cluster, args.jobs, args.all_files)
@@ -81,6 +96,14 @@ def main(argv=None):
             print(f'! {os.path.basename(path)}: {why}', file=sys.stderr)
         print(f'\n{n_ok} intact, {len(photos) - n_ok} need repair.  Next: cr2-rescue recover {" ".join(args.paths)} -o OUT')
         return 0
+    if args.cmd == 'sharpen':
+        from .sharpen import sharpen
+        try:
+            rows = sharpen(args.rescued, args.out, args.method, args.upscaler, args.model, args.jobs, args.quality)
+        except ImportError as e:
+            print(e, file=sys.stderr)
+            return 2
+        return 0 if any(r['output'] for r in rows) or not rows else 1
     from .recover import Options, recover
     opt = Options(cluster=args.cluster, jobs=args.jobs, global_search=args.global_search, passes=args.passes,
                   exiftool=args.exiftool, all_files=args.all_files, keep_work=args.keep_work, quality=args.quality)

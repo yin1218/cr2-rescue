@@ -24,6 +24,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - run: pip install -e '.[dev]'
+      - run: pip install -e '.[dev,sharpen]'
       - run: pytest -q
       - run: cr2-rescue --help

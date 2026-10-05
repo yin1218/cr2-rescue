@@ -4,7 +4,7 @@ title: "cr2-rescue: recover corrupted and fragmented Canon CR2 photos"
 authors:
   - family-names: Wu
     given-names: Chien-Yin
-version: 0.1.0
+version: 0.2.0
 date-released: 2026-10-05
 license: MIT
 repository-code: https://github.com/yin1218/cr2-rescue
